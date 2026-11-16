@@ -39,6 +39,8 @@ CREATE INDEX IF NOT EXISTS ix_punches_pending
     ON punches (next_retry_at, attempts) WHERE synced = 0;
 CREATE INDEX IF NOT EXISTS ix_punches_dev_time
     ON punches (device_id, checktime);
+CREATE INDEX IF NOT EXISTS ix_punches_time
+    ON punches (checktime);
 
 CREATE TABLE IF NOT EXISTS bad_records (
     device_id  INTEGER NOT NULL,

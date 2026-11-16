@@ -21,7 +21,7 @@ local network and stores it in the Oracle table `checkinout`.
 6. [Run the app](#6-run-the-app)
 7. [Check that it is working](#7-check-that-it-is-working)
 8. [Run automatically at Windows startup](#8-run-automatically-at-windows-startup)
-9. [Build a standalone .exe](#9-build-a-standalone-exe)
+9. [Build the .exe](#9-build-the-exe)
 10. [Daily operation](#10-daily-operation)
 11. [Troubleshooting](#11-troubleshooting)
 12. [Settings reference](#12-settings-reference)
@@ -64,8 +64,8 @@ python -m venv .venv
 pip install --no-index --find-links wheels -r requirements.txt
 ```
 
-> Easiest offline option: build the `.exe` once on a PC with internet ([section 9](#9-build-a-standalone-exe))
-> and copy only `zkteco_sync.exe` + `settings.env` to the server. Python is then not needed.
+> Easiest offline option: build `ZKTecoSync.exe` once on a PC with internet ([section 9](#9-build-the-exe))
+> and copy only that file to the server. Python is then not needed there.
 
 ---
 
@@ -97,80 +97,110 @@ COMMIT;
 
 * You can add, remove or change devices **while the app is running**. Changes are picked up within 5 minutes.
 * On each device check **Menu → Comm → Ethernet** (IP address) and **Comm → PC Connection**
-  (Comm Key / port). If a Comm Key is set, put it in `device_password` ([section 12](#12-settings-reference)).
+  (Comm Key / port). If a Comm Key is set, add `DEVICE_PASSWORD=<key>` to `settings.env` ([section 12](#12-settings-reference)).
   It is the same key for all devices.
 
 ---
 
 ## 5. Configure the connection
 
-Edit **`settings.env`** in the app folder:
+### With the program window (recommended)
+1. Open `ZKTecoSync.exe` (or `python sync_gui.py`).
+2. On the **Database** tab enter the Oracle **Server** (host name or IP), **Port** (usually 1521),
+   **Database** name (tick *Service name* or *SID*), **User** and **Password**.
+3. Click **Test connection**. You should see `Connected to Oracle …` and the row counts of
+   `device_machines` and `checkinout`. If a table is not accessible, the reason is shown in red.
+4. Click **Save**. The settings are written to `settings.env` next to the program. If the service is
+   running in the window, you are asked to restart it so it uses the new settings.
 
+### Or by editing `settings.env`
 ```ini
 DB_USER=attendance_user
 DB_PASSWORD=your_password
 DB_DSN=192.168.1.10:1521/ORCL
+AUTOSTART_SERVICE=0
 ```
+`DB_DSN` is `host:port/service_name`. (For a SID the window writes a full Oracle connect descriptor.)
 
-`DB_DSN` formats: `host:port/service_name` (most common) or `host:port:SID`.
+> `settings.env` contains the database password in plain text. Keep the app folder accessible to
+> administrators only.
 
-> Values in `settings.env` override Windows environment variables with the same name.
-
-All other settings (poll interval, retry times …) are in `config.py` and have sensible defaults.
-See [section 12](#12-settings-reference).
+All other settings (poll interval, device Comm Key, retry times …) have sensible defaults and can
+be overridden in `settings.env`. See [section 12](#12-settings-reference).
 
 ---
 
 ## 6. Run the app
 
+### a) With the window
+Double-click **`ZKTecoSync.exe`** and click **Start** (top left).
+
+```
+ Service: Running   [Start] [Stop]          Records collected: 15,230 | Waiting for Oracle: 0
+ ┌──────────┬─────────┬─────────┬──────┐
+ │ Database │ Devices │ Records │ Logs │
+```
+
+| Part | What it shows / does |
+|---|---|
+| **Service** (top) | `Running`, `Running in background (another process)` (see section 8), or `Stopped - records are NOT being collected` in red |
+| **Start / Stop** | Starts or stops collecting inside this window |
+| **Totals** (top right) | Records collected, records still waiting for Oracle, and failing records (red) |
+| **Database** tab | Oracle connection settings: test and save ([section 5](#5-configure-the-connection)) |
+| **Devices** tab | Every device in `device_machines`: IP, port, ONLINE/OFFLINE, status time, records collected, waiting, failing, latest punch. Click **Refresh** to update. |
+| **Records** tab | Every record ever collected. Filter by device, user ID, date range (`YYYY-MM-DD`) and state (*In Oracle / Waiting / Failing*), then **Search**. Shows the newest 2,000; **Export CSV…** saves all matching records in a file Excel can open. Double-click a row for details. |
+| **Logs** tab | Live view of `zkteco_sync.log`. Filter *All / Warnings and errors / Errors only / Summary only*. Errors are red and warnings orange. **Open log folder** opens the folder in Explorer. |
+
+Tick **Start the service automatically when this program opens** on the Database tab (then **Save**)
+to start collecting as soon as the window opens.
+
+**Closing the window stops collecting** (you are asked first). Nothing is lost: records stay on the
+devices and in the journal and are collected next time. For a server that must collect 24/7,
+run the background service instead ([section 8](#8-run-automatically-at-windows-startup)).
+
+### b) Without a window (background service)
+```bat
+ZKTecoSync.exe --service
+```
+Collects exactly like the window but without one. It logs to `zkteco_sync.log` and is meant for
+Task Scheduler ([section 8](#8-run-automatically-at-windows-startup)). You can still open
+`ZKTecoSync.exe` normally at the same time to watch devices, records and logs.
+
+### c) From Python (without the .exe)
 ```bat
 cd C:\ZKTecoSync
 .venv\Scripts\activate.bat
-python sync_service.py
+python sync_gui.py
 ```
-or, with the built executable:
-```bat
-zkteco_sync.exe
-```
+or `python sync_service.py` for the console version (stop it with `Ctrl+C`).
 
-What you should see in the first minute:
+### Only one collector at a time
+Only one copy can collect at a time (window **or** background service). A second copy refuses to
+start (`Another copy of the sync service is already running`), and the window shows
+`Running in background` with Start disabled.
+
+### What happens on the first run
+The app reads every record stored on every device and checks each one against Oracle:
 ```
-[INFO] main: Starting ZKTeco sync service. Journal: C:\ZKTecoSync\zkteco_journal.db
-[INFO] oracle: Oracle connection pool created.
-[INFO] Device-1: Collector started for 192.168.1.201:4370.
 [INFO] Device-1: Read 15230 record(s) from device (layout 40 bytes); 15230 NEW saved to journal.
 [INFO] OracleSync: Oracle sync: 500 sent, 12 inserted, 488 already present, 500 verified, 0 failed.
 ```
-
-On the **first run** the app reads every record stored on every device and checks each one against
-Oracle. Records that are already there are counted as `already present` and are not duplicated.
-This can take a few minutes for large devices. After that, only new records are sent.
-
-**Stop the app** with `Ctrl+C`. It finishes sending what it can and exits. Anything not yet sent
-stays in the journal and is sent on the next start, so stopping or even a power cut loses nothing.
+Records already in Oracle are counted as `already present` and are never duplicated. For large
+devices this can take a few minutes. After that, only new records are sent.
 
 ---
 
 ## 7. Check that it is working
 
-### a) Status command (works any time, even while the app is running)
-```bat
-python sync_service.py --status
-```
-or `zkteco_sync.exe --status`
-```
-Device   Records  Pending  Failing  Latest punch
-     1     15230        0        0  2026-11-16 08:41:06
-     2      9874        0        0  2026-11-16 08:40:13
+### a) In the window
+* Top: **Service: Running** and **Waiting for Oracle** at 0 (or small for a few seconds).
+* **Devices** tab: every device **ONLINE**, with *Latest punch* matching the newest punch on the device.
+* **Records** tab: search for the current date to see the punches of the day.
+  State **In Oracle** = confirmed in Oracle; **Waiting** = not sent yet; **Failing** = Oracle
+  rejected it (the *Error* column says why, and it is retried automatically).
 
-All records are in Oracle.
-```
-* **Records**: records collected from that device so far.
-* **Pending**: collected but not yet confirmed in Oracle (normally 0, or small for a few seconds).
-* **Failing**: Oracle rejected them. The reason is printed below the table. They are kept and retried.
-
-### b) The log file `zkteco_sync.log`
-Every 10 minutes the log writes a `[summary]` line per device:
+### b) The log
+Every 10 minutes the log writes a `[summary]` line per device (Logs tab → *Summary only*):
 ```
 [summary] device 1 192.168.1.201:4370 | ONLINE | last OK read: 2026-11-16 08:41:10 | on device: 15230 | journal: 15230 | pending Oracle: 0 | failing: 0
 ```
@@ -186,12 +216,15 @@ Lines to look out for:
 | `missing in Oracle -> re-queued` | The hourly audit found records deleted from Oracle and is re-inserting them. |
 | `attendance log is 90% full` | Clear the device log soon (see [section 10](#10-daily-operation)). |
 
-### c) In Oracle
+### c) Console status (Python only)
+`python sync_service.py --status` prints the same per-device counts in a console window.
+
+### d) In Oracle
 ```sql
 -- device status (updated every minute)
 SELECT ID, IP, STATUS, STATUS_TIME FROM device_machines;
 
--- today's records per device
+-- records of the current day per device
 SELECT DEVICEID, COUNT(*) FROM checkinout
  WHERE CHECKTIME >= TRUNC(SYSDATE) GROUP BY DEVICEID;
 ```
@@ -200,66 +233,54 @@ SELECT DEVICEID, COUNT(*) FROM checkinout
 
 ## 8. Run automatically at Windows startup
 
-Use the built-in **Task Scheduler** (no extra software needed):
+Recommended for production: the background service starts with Windows, before anyone logs on,
+and restarts itself if it stops.
 
 1. Open **Task Scheduler** → **Create Task…**
-2. **General**: Name `ZKTeco Sync`; select **Run whether user is logged on or not** and **Run with highest privileges**.
+2. **General**: Name `ZKTeco Sync`; select **Run whether user is logged on or not** and
+   **Run with highest privileges**.
 3. **Triggers** → New → **At startup**.
 4. **Actions** → New → Start a program:
-   * Program: `C:\ZKTecoSync\zkteco_sync.exe`
-     (or `C:\ZKTecoSync\.venv\Scripts\python.exe` with argument `sync_service.py`)
-   * **Start in**: `C:\ZKTecoSync`   ← required
+   * Program: `C:\ZKTecoSync\ZKTecoSync.exe`
+   * Arguments: `--service`
+   * Start in: `C:\ZKTecoSync`
 5. **Settings**: tick **If the task fails, restart every 1 minute**, attempts `999`;
    untick **Stop the task if it runs longer than…**
 6. OK, then right-click the task → **Run**.
 
-Only run **one copy** of the app at a time.
+Then open `ZKTecoSync.exe` normally whenever you want to look. It shows
+**Running in background (another process)**, and the Devices, Records and Logs tabs work as usual.
+
+**After changing the database settings** in the window, restart the task: right-click → **End**,
+then **Run**.
+
+*Simpler alternative (only while a user is logged on):* tick **Start the service automatically
+when this program opens**, then put a shortcut to `ZKTecoSync.exe` in the Startup folder
+(`Win+R` → `shell:startup`).
 
 ---
 
-## 9. Build a standalone .exe
+## 9. Build the .exe
 
-On a PC with Python and the requirements installed:
+On a PC with internet (to install PyInstaller), in the project folder:
 ```bat
-pip install pyinstaller
-python -m PyInstaller --onefile --add-data "settings.env;." --name zkteco_sync ^
-  --hidden-import oracledb ^
-  --hidden-import zk ^
-  --hidden-import sqlite3 ^
-  --hidden-import journal ^
-  --hidden-import zk_reader ^
-  --hidden-import getpass ^
-  --hidden-import socket ^
-  --hidden-import struct ^
-  --hidden-import threading ^
-  --hidden-import signal ^
-  --hidden-import cryptography ^
-  --hidden-import cryptography.x509 ^
-  --hidden-import cryptography.hazmat.primitives ^
-  --hidden-import cryptography.hazmat.primitives.kdf ^
-  --hidden-import cryptography.hazmat.primitives.kdf.pbkdf2 ^
-  --hidden-import cryptography.hazmat.primitives.kdf.scrypt ^
-  --hidden-import cryptography.hazmat.primitives.ciphers ^
-  --hidden-import cryptography.hazmat.primitives.ciphers.algorithms ^
-  --hidden-import cryptography.hazmat.primitives.ciphers.modes ^
-  --hidden-import cryptography.hazmat.primitives.asymmetric ^
-  --hidden-import cryptography.hazmat.primitives.asymmetric.rsa ^
-  --hidden-import cryptography.hazmat.primitives.asymmetric.padding ^
-  --hidden-import cryptography.hazmat.primitives.serialization ^
-  --hidden-import cryptography.hazmat.primitives.hashes ^
-  --hidden-import cryptography.hazmat.primitives.hmac ^
-  --hidden-import cryptography.hazmat.backends ^
-  --hidden-import cryptography.hazmat.backends.openssl ^
-  --hidden-import cryptography.hazmat.backends.openssl.backend ^
-  --hidden-import cryptography.hazmat.bindings ^
-  --hidden-import cryptography.hazmat.bindings._rust ^
-  sync_service.py
+python -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt pyinstaller
+build_exe.bat
 ```
-The result is `dist\zkteco_sync.exe`. Copy it to the server folder together with `settings.env`.
-A `settings.env` placed next to the `.exe` overrides the one built into it, so you can change the
-password without rebuilding.
+The result is **`dist\ZKTecoSync.exe`** (about 18 MB). It contains Python, the Oracle driver and the
+device library, so nothing else needs to be installed on the server.
 
-The journal (`zkteco_journal.db`) and log are created **next to the .exe**.
+**Deploy:** create `C:\ZKTecoSync`, copy `ZKTecoSync.exe` into it, open it and configure the
+Database tab. `settings.env`, `zkteco_journal.db` and `zkteco_sync.log` are created **next to the
+.exe**, whatever folder it is started from.
+
+Notes:
+* The password is **not** built into the .exe. It lives in `settings.env` next to it.
+* The .exe unpacks itself to `%TEMP%` at start (normal for one-file programs). If antivirus blocks
+  it, add an exclusion for `C:\ZKTecoSync\ZKTecoSync.exe`.
+* When updating to a new version, stop the window/task, replace only `ZKTecoSync.exe`, and start
+  again. Keep `zkteco_journal.db` and `settings.env`.
 
 ---
 
@@ -268,8 +289,8 @@ The journal (`zkteco_journal.db`) and log are created **next to the .exe**.
 ### Clearing a device's attendance log safely
 ZKTeco devices have limited memory. Before clearing a device's log (on the device, or with ZKTime):
 1. Wait at least 2 minutes after the last punch.
-2. Run `zkteco_sync.exe --status`. That device must show **Pending 0** and **Failing 0**, and
-   **Latest punch** must match the latest punch on the device.
+2. Open `ZKTecoSync.exe` → **Devices** tab → **Refresh**. That device must show **Waiting for
+   Oracle 0** and **Failing 0**, and **Latest punch** must match the latest punch on the device.
 3. Now clear the log.
 
 > The only way a record can be lost is if it is deleted from a device **before the app has read it**,
@@ -288,7 +309,7 @@ The app is designed to put back anything missing, so rows deleted from `checkino
 * the hourly audit re-inserts any journal record from the last 31 days.
 
 To remove test punches permanently: clear them from the **device** first (after checking
-`--status` as above), then stop the app, delete the rows in Oracle, and delete the same rows
+the Devices tab as above), then stop the app, delete the rows in Oracle, and delete the same rows
 from the journal table `punches` (or delete `zkteco_journal.db` entirely; it is rebuilt from what
 is still on the devices). Then start the app again.
 
@@ -307,7 +328,7 @@ lost, but readings can be delayed.
 | `DPY-6001: Service "..." is not registered with the listener` | Wrong service name in `DB_DSN`, or the database instance is not started. |
 | `ORA-01017: invalid username/password` | Fix `DB_USER` / `DB_PASSWORD` in `settings.env`. |
 | `Device poll failed: ... timed out` | Wrong IP/port in `device_machines`, device off, cable/switch issue, or firewall. Test with `ping 192.168.1.201` and check that the device's IP is reachable. |
-| `Unauthenticated` | The device has a Comm Key. Set `device_password` in `config.py`. |
+| `Unauthenticated` | The device has a Comm Key. Add `DEVICE_PASSWORD=<key>` to `settings.env` and restart. |
 | `ORA-00001 … this punch is NOT in checkinout: the ID primary key/identity probably collided` | `checkinout.ID` values were inserted manually and the identity counter is behind. Fix: `ALTER TABLE checkinout MODIFY ID GENERATED BY DEFAULT AS IDENTITY (START WITH LIMIT VALUE);`. The waiting records are then inserted automatically. |
 | `ORA-02291 integrity constraint … FK_CHECKINOUT_DEVICE` | A device ID was removed from `device_machines` while it still had records. Re-add it. |
 | `Inconsistent log read (attempt 1/3)` (occasionally) | Someone punched during the read. The read is retried. This is normal. |
@@ -318,8 +339,14 @@ lost, but readings can be delayed.
 
 ## 12. Settings reference
 
-Database connection: `settings.env` (`DB_USER`, `DB_PASSWORD`, `DB_DSN`).
-Everything else is in `SYNC_CONFIG` in `config.py`:
+Database connection: `settings.env` (`DB_USER`, `DB_PASSWORD`, `DB_DSN`, `AUTOSTART_SERVICE`).
+Everything else has a default in `SYNC_CONFIG` in `config.py`. **Any of them can be overridden in
+`settings.env` with its name in UPPERCASE**. This is the way to change them for the `.exe`:
+```ini
+DEVICE_PASSWORD=12345
+POLL_INTERVAL_SECONDS=30
+```
+Restart the service after changing `settings.env`.
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -379,11 +406,14 @@ Everything else is in `SYNC_CONFIG` in `config.py`:
 ### Project files
 | File | Purpose |
 |---|---|
-| `sync_service.py` | The app: device collectors, Oracle sync, audit, supervisor, `--status` |
+| `ZKTecoSync.exe` | The built program: window, or background service with `--service` |
+| `sync_gui.py` | The window (Database / Devices / Records / Logs) and the .exe entry point |
+| `sync_service.py` | The collector: device readers, Oracle sync, audit, supervisor, `--status` |
 | `zk_reader.py` | Reads and checks the attendance log stored on a device |
 | `journal.py` | Local journal (SQLite) |
 | `config.py` | Settings |
 | `settings.env` | Database user / password / address |
 | `setup_db.sql` | Creates the Oracle tables |
+| `build_exe.bat` | Builds `dist\ZKTecoSync.exe` |
 | `zkteco_journal.db` | Created at runtime: local copy of every record. **Keep it, back it up.** |
 | `zkteco_sync.log` | Created at runtime: log file (rotated, 10 × 10 MB) |

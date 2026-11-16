@@ -3,3 +3,8 @@ zkteco_journal.db
 zkteco_journal.db-wal
 zkteco_journal.db-shm
 zkteco_sync.log.*
+zkteco_sync.lock
+settings.env.tmp
+build/
+dist/
+*.spec

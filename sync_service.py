@@ -61,8 +61,16 @@ def _app_path(p: str) -> str:
 
 
 # ── Logging ────────────────────────────────────────────────────────────────────
+class _OneLineFormatter(logging.Formatter):
+    """Keep each message on one line (Oracle errors contain newlines)."""
+
+    def formatMessage(self, record):
+        record.message = record.message.replace("\r", "").replace("\n", " | ")
+        return super().formatMessage(record)
+
+
 def setup_logging():
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    fmt = _OneLineFormatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     fh = logging.handlers.RotatingFileHandler(
@@ -72,9 +80,99 @@ def setup_logging():
         encoding="utf-8",
     )
     fh.setFormatter(fmt)
-    sh = logging.StreamHandler(sys.stdout)
-    sh.setFormatter(fmt)
-    root.handlers[:] = [fh, sh]
+    handlers = [fh]
+    if sys.stdout is not None:          # no console in the windowed .exe
+        sh = logging.StreamHandler(sys.stdout)
+        sh.setFormatter(fmt)
+        handlers.append(sh)
+    root.handlers[:] = handlers
+
+
+# ── Single instance lock (only one process may collect at a time) ─────────────
+LOCK_PATH = _app_path("zkteco_sync.lock")
+
+
+class InstanceLock:
+    def __init__(self, path: str = LOCK_PATH):
+        self.path = path
+        self._f = None
+
+    def acquire(self) -> bool:
+        f = open(self.path, "a+")
+        try:
+            if os.name == "nt":
+                import msvcrt
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            f.close()
+            return False
+        self._f = f
+        return True
+
+    def release(self):
+        if self._f is None:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+                self._f.seek(0)
+                msvcrt.locking(self._f.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+        self._f.close()
+        self._f = None
+
+
+def watch_launcher(on_exit) -> bool:
+    """
+    A one-file PyInstaller .exe runs as two processes: a small launcher and
+    this program. If the launcher is killed (Task Scheduler "End", Task
+    Manager), this process would keep running orphaned. Watch the launcher
+    and call on_exit() when it disappears so we shut down cleanly.
+    Returns True if a watcher was started.
+    """
+    if not getattr(sys, "frozen", False) or os.name != "nt":
+        return False
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    k32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    k32.QueryFullProcessImageNameW.argtypes = (wintypes.HANDLE, wintypes.DWORD,
+                                               wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD))
+    SYNCHRONIZE, QUERY_LIMITED = 0x00100000, 0x1000
+    handle = k32.OpenProcess(SYNCHRONIZE | QUERY_LIMITED, False, os.getppid())
+    if not handle:
+        return False
+    buf = ctypes.create_unicode_buffer(1024)
+    size = wintypes.DWORD(len(buf))
+    if not k32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+        return False
+    # Only the launcher of this same .exe counts (never e.g. explorer.exe).
+    if os.path.normcase(os.path.abspath(buf.value)) != os.path.normcase(os.path.abspath(sys.executable)):
+        return False
+
+    def wait():
+        k32.WaitForSingleObject(handle, 0xFFFFFFFF)
+        logging.getLogger("main").info("Launcher process ended - shutting down.")
+        on_exit()
+
+    threading.Thread(target=wait, name="LauncherWatch", daemon=True).start()
+    return True
+
+
+def service_running_elsewhere() -> bool:
+    """True if another process currently holds the collector lock."""
+    probe = InstanceLock()
+    if probe.acquire():
+        probe.release()
+        return False
+    return True
 
 
 # ── Check type mapping ─────────────────────────────────────────────────────────
@@ -145,7 +243,7 @@ class OracleSink:
                     ping_interval=30,
                     tcp_connect_timeout=10,
                 )
-                self.log.info("Oracle connection pool created.")
+                self.log.debug("Oracle connection pool created.")
             return self._pool
 
     def _acquire(self):
@@ -440,16 +538,23 @@ class OracleSyncWorker(threading.Thread):
         self.log = logging.getLogger(self.name)
         self._down_since = None
         self._last_down_log = 0.0
+        self._last_status_err = 0.0
+
+    def _write_statuses(self):
+        """Device status is informational: a failure here must never block records."""
+        items = self.board.due()
+        if not items:
+            return
+        try:
+            self.sink.write_statuses(items)
+            self.board.mark_written(items)
+        except Exception as exc:
+            if time.monotonic() - self._last_status_err >= 600:
+                self._last_status_err = time.monotonic()
+                self.log.warning("Could not update device_machines.STATUS (records are not affected): %s", exc)
 
     def _cycle(self):
-        items = self.board.due()
-        if items:
-            try:
-                self.sink.write_statuses(items)
-                self.board.mark_written(items)
-            except Exception as exc:
-                self.log.warning("Could not update device status: %s", exc)
-                raise
+        self._write_statuses()
 
         batch = int(_cfg("oracle_batch_size", 500))
         while True:
@@ -608,17 +713,18 @@ class Supervisor:
         if bad:
             self.log.warning("[summary] %d undecodable record(s) stored in journal table bad_records.", bad)
 
-    def run(self):
+    def run(self, install_signals: bool = True):
         self.log.info("Starting ZKTeco sync service. Journal: %s", self.journal.path)
 
         def _shutdown(sig, frame):
             self.log.info("Shutdown signal received - stopping...")
             self.stop.set()
 
-        signal.signal(signal.SIGINT, _shutdown)
-        signal.signal(signal.SIGTERM, _shutdown)
-        if hasattr(signal, "SIGBREAK"):
-            signal.signal(signal.SIGBREAK, _shutdown)
+        if install_signals:
+            signal.signal(signal.SIGINT, _shutdown)
+            signal.signal(signal.SIGTERM, _shutdown)
+            if hasattr(signal, "SIGBREAK"):
+                signal.signal(signal.SIGBREAK, _shutdown)
 
         sync = OracleSyncWorker(self.journal, self.sink, self.board, self.stop)
         audit = AuditWorker(self.journal, self.sink, self.stop)
@@ -685,12 +791,27 @@ def print_status():
           f"\n{pending} record(s) not yet in Oracle (they will be retried automatically).")
 
 
+def run_headless():
+    """Run the collector without UI (console, Task Scheduler)."""
+    setup_logging()
+    lock = InstanceLock()
+    if not lock.acquire():
+        logging.getLogger("main").error(
+            "Another copy of the sync service is already running (lock: %s). Exiting.", LOCK_PATH)
+        sys.exit(2)
+    try:
+        sup = Supervisor()
+        watch_launcher(sup.stop.set)
+        sup.run()
+    finally:
+        lock.release()
+
+
 def main():
     if "--status" in sys.argv[1:]:
         print_status()
         return
-    setup_logging()
-    Supervisor().run()
+    run_headless()
 
 
 if __name__ == "__main__":

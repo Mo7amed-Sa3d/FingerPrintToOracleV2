@@ -18,23 +18,54 @@ def _app_dir() -> str:
 APP_DIR = _app_dir()
 
 
-# Read from environment file if it exists (current dir first, then app dir,
-# then the PyInstaller bundle dir).
+ENV_PATH = os.path.join(APP_DIR, "settings.env")   # where the UI saves settings
+LOADED_ENV_PATH = None
+
+
+# Read from environment file if it exists (app/exe folder first, then current
+# dir, then the PyInstaller bundle dir).
 def load_env():
-    candidates = [os.path.join(os.getcwd(), "settings.env"),
-                  os.path.join(APP_DIR, "settings.env")]
+    global LOADED_ENV_PATH
+    candidates = [ENV_PATH, os.path.join(os.getcwd(), "settings.env")]
     if hasattr(sys, "_MEIPASS"):
         candidates.append(os.path.join(sys._MEIPASS, "settings.env"))
     for path in candidates:
         try:
-            with open(path, "r") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 for line in f:
                     if "=" in line and not line.startswith("#"):
                         key, val = line.strip().split("=", 1)
-                        os.environ[key] = val
+                        os.environ[key.strip()] = val
+            LOADED_ENV_PATH = path
             return
         except FileNotFoundError:
             continue
+
+
+def save_env(values: dict) -> str:
+    """Update/insert keys in settings.env next to the app (keeps other lines)."""
+    path = ENV_PATH
+    lines = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        pass
+    remaining = dict(values)
+    out = []
+    for line in lines:
+        key = line.split("=", 1)[0].strip() if "=" in line and not line.startswith("#") else None
+        if key in remaining:
+            out.append(f"{key}={remaining.pop(key)}")
+        else:
+            out.append(line)
+    out.extend(f"{k}={v}" for k, v in remaining.items())
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(out) + "\n")
+    os.replace(tmp, path)
+    os.environ.update({k: str(v) for k, v in values.items()})
+    return path
 
 
 load_env()
@@ -50,6 +81,11 @@ DB_CONFIG = {
     "password": os.getenv("DB_PASSWORD", "12345"),
     "dsn": os.getenv("DB_DSN", "localhost:1521/attendance"),
 }
+
+
+def apply_db_config(user: str, password: str, dsn: str):
+    """Change the DB settings for this process (dict is updated in place)."""
+    DB_CONFIG.update({"user": user, "password": password, "dsn": dsn})
 
 # ── Sync Behaviour ─────────────────────────────────────────────────────────────
 SYNC_CONFIG = {
@@ -110,3 +146,32 @@ SYNC_CONFIG = {
     "log_backup_count":   10,
     "status_summary_interval_seconds": 600,
 }
+
+
+# ── Overrides from settings.env / environment ──────────────────────────────────
+# Any SYNC_CONFIG key can be overridden with its UPPERCASE name, e.g.
+#   DEVICE_PASSWORD=12345
+#   POLL_INTERVAL_SECONDS=30
+# (this is how settings are changed for the built .exe, where config.py is compiled in)
+def _apply_overrides():
+    for key, default in list(SYNC_CONFIG.items()):
+        raw = os.getenv(key.upper())
+        if raw is None or raw.strip() == "":
+            continue
+        raw = raw.strip()
+        try:
+            if isinstance(default, bool):
+                value = raw.lower() in ("1", "true", "yes", "y", "on")
+            elif isinstance(default, int):
+                value = int(raw)
+            elif isinstance(default, float):
+                value = float(raw)
+            else:
+                value = raw
+        except ValueError:
+            print(f"settings.env: ignoring invalid value {key.upper()}={raw!r}", file=sys.stderr)
+            continue
+        SYNC_CONFIG[key] = value
+
+
+_apply_overrides()
