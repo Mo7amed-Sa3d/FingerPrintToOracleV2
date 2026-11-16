@@ -658,7 +658,37 @@ class Supervisor:
                       "will be sent on next start.")
 
 
+def print_status():
+    """`--status`: print what the local journal holds (no device/Oracle access)."""
+    path = _app_path(_cfg("journal_path", "zkteco_journal.db"))
+    if not os.path.exists(path):
+        print(f"No journal yet at {path}")
+        return
+    j = Journal(path)
+    stats = j.stats()
+    last = dict(j._conn().execute(
+        "SELECT device_id, MAX(checktime) FROM punches GROUP BY device_id").fetchall())
+    print(f"Journal: {path}\n")
+    print(f"{'Device':>6} {'Records':>9} {'Pending':>8} {'Failing':>8}  Latest punch")
+    for dev in sorted(stats):
+        s = stats[dev]
+        print(f"{dev:>6} {s['total']:>9} {s['pending']:>8} {s['failing']:>8}  {last.get(dev, '')}")
+    if not stats:
+        print("   (no records yet)")
+    for dev, uid, ct, attempts, err in j.failing_samples(20):
+        print(f"\nFAILING device={dev} user={uid} time={ct} attempts={attempts}\n   {err}")
+    bad = j.bad_count()
+    if bad:
+        print(f"\n{bad} undecodable record(s) in table bad_records.")
+    pending = sum(s["pending"] for s in stats.values())
+    print("\nAll records are in Oracle." if pending == 0 else
+          f"\n{pending} record(s) not yet in Oracle (they will be retried automatically).")
+
+
 def main():
+    if "--status" in sys.argv[1:]:
+        print_status()
+        return
     setup_logging()
     Supervisor().run()
 
