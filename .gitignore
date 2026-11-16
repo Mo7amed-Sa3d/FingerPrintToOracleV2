@@ -1,1 +1,5 @@
 __pycache__/config.cpython-313.pyc
+zkteco_journal.db
+zkteco_journal.db-wal
+zkteco_journal.db-shm
+zkteco_sync.log.*

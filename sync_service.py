@@ -1,398 +1,666 @@
 """
-ZKTeco → Oracle SQL Real-Time Attendance Sync Service
-=====================================================
-Reads devices from the `device_machines` table.
-Inserts punches into the `checkinout` table.
+ZKTeco -> Oracle SQL Attendance Sync Service (zero-loss design)
+===============================================================
+
+Why the previous version lost records
+-------------------------------------
+* pyzk's live_capture() drops events (only the first event of a TCP read is
+  parsed, several packet sizes are not handled, non-numeric user ids crash it)
+  and never notices a dead connection, so a device could sit "ONLINE" while
+  nothing was received. Back-fill only ran on reconnect, which then never came.
+* Failed Oracle inserts were logged and forgotten.
+* pyzk's get_attendance() can mis-parse the whole log if someone punches
+  during the read, and one corrupt record breaks every read.
+* Every ORA-00001 was treated as "duplicate", even when it was the ID
+  primary key colliding, so a genuinely new punch was thrown away.
+
+How this version works
+----------------------
+1. DeviceWorker (one per device) polls: connect -> read the device's FULL
+   stored log (validated parser, see zk_reader.py) -> save every record not
+   yet known into the local SQLite journal (fsync'd) -> disconnect.
+   The device's own memory is the source of truth; a punch made while the
+   network/app/Oracle was down is simply picked up on the next poll.
+   Every poll is a fresh connection, so reconnection is built in; failures
+   back off exponentially (5s .. 60s) and retry forever.
+2. OracleSyncWorker sends journal records that are not yet synced to Oracle,
+   then READS THEM BACK from Oracle. Only records found in Oracle are marked
+   synced. Anything else stays pending and is retried with back-off.
+3. AuditWorker periodically compares all synced journal records (last N days)
+   with Oracle and re-sends anything Oracle is missing.
+4. Supervisor reloads device_machines periodically (cached locally so the
+   service keeps collecting even if Oracle is down at startup) and logs a
+   health summary.
 """
 
+from __future__ import annotations
+
 import logging
+import logging.handlers
+import os
 import signal
 import sys
 import threading
 import time
+from datetime import datetime, timedelta
 
 import oracledb
 from zk import ZK
 
-from config import DB_CONFIG, SYNC_CONFIG
+from config import APP_DIR, DB_CONFIG, SYNC_CONFIG
+from journal import Journal, TS_FMT, str_to_ts, ts_to_str
+from zk_reader import AttendanceReadError, read_attendance
+
+
+def _cfg(key, default):
+    return SYNC_CONFIG.get(key, default)
+
+
+def _app_path(p: str) -> str:
+    return p if os.path.isabs(p) else os.path.join(APP_DIR, p)
+
 
 # ── Logging ────────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.FileHandler("zkteco_sync.log"),
-        logging.StreamHandler(sys.stdout),
-    ],
-)
-
-
-# ── Oracle connection pool ─────────────────────────────────────────────────────
-_pool: oracledb.ConnectionPool | None = None
-
-# ── Devices currently owned by a live DeviceWorker connection ──────────────────
-# ZKTeco devices generally accept only ONE active connection at a time.
-# DeviceMonitor must never ping a device a worker already has open, or it will
-# knock the worker's live_capture() session offline.
-_connected_devices: set[int] = set()
-_connected_devices_lock = threading.Lock()
-
-
-def _init_pool(pool_size: int):
-    global _pool
-    _pool = oracledb.create_pool(
-        user=DB_CONFIG["user"],
-        password=DB_CONFIG["password"],
-        dsn=DB_CONFIG["dsn"],
-        min=2,
-        max=pool_size,
-        increment=1,
+def setup_logging():
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    fh = logging.handlers.RotatingFileHandler(
+        _app_path(_cfg("log_file", "zkteco_sync.log")),
+        maxBytes=int(_cfg("log_max_bytes", 10 * 1024 * 1024)),
+        backupCount=int(_cfg("log_backup_count", 10)),
+        encoding="utf-8",
     )
-    logging.getLogger("db").info(f"Oracle connection pool created (max={pool_size}).")
+    fh.setFormatter(fmt)
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+    root.handlers[:] = [fh, sh]
 
 
-def get_db() -> oracledb.Connection:
-    return _pool.acquire()
+# ── Check type mapping ─────────────────────────────────────────────────────────
+_IN_STATES = {0, 3, 4}     # Check-In, Break-In, OT-In
+_OUT_STATES = {1, 2, 5}    # Check-Out, Break-Out, OT-Out
 
 
-# ── DB helpers ─────────────────────────────────────────────────────────────────
-
-def get_devices_from_db(conn=None) -> list[dict]:
-    """
-    Read devices from the device_machines table.
-    Returns a list of dicts with keys: device_id, ip, port.
-    """
-    if conn is None:
-        conn = get_db()
-        own_conn = True
-    else:
-        own_conn = False
-
-    try:
-        cur = conn.cursor()
-        # Adjust column names if your table uses different names
-        cur.execute("""
-            SELECT ID, IP, PORT
-            FROM device_machines
-        """)
-        rows = cur.fetchall()
-        devices = []
-        for row in rows:
-            devices.append({
-                "device_id": row[0],
-                "ip": row[1],
-                "port": row[2] if row[2] is not None else 4370,
-            })
-        return devices
-    finally:
-        if own_conn:
-            conn.close()
+def checktype_for(status, punch) -> str:
+    if _cfg("checktype_mode", "punch") == "status":
+        return "I" if status == 1 else "O"       # legacy behaviour
+    if punch in _OUT_STATES:
+        return "O"
+    return "I"   # _IN_STATES, and unknown states (e.g. 255 on devices without a state key)
 
 
-def set_device_status(device_id: int, status: str):
-    """Update status and status_time in device_machines."""
-    conn = get_db()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            UPDATE device_machines
-               SET status = :p_status,
-                   status_time = SYSTIMESTAMP
-             WHERE ID = :p_id
-            """,
-            p_status=status,
-            p_id=device_id,
-        )
-        conn.commit()
-    finally:
-        conn.close()
+# ── Device status board (device threads never touch Oracle directly) ──────────
+class StatusBoard:
+    HEARTBEAT = 60  # re-write unchanged ONLINE status at least this often
 
-def insert_punch(user_id: str, punch_time, punch_status, verify_code: int, device_id: int) -> int:
-    """
-    Insert a single attendance record into checkinout.
-    Returns 1 if inserted, 0 if duplicate (unique constraint).
-    """
-    conn = get_db()
-    try:
-        cur = conn.cursor()
-        # Convert punch_status to Checktype: 'I' (in) or 'O' (out)
-        # In the zk library, status=1 often means IN, 0 means OUT.
-        # Adjust if your device uses opposite values.
-        checktype = 'I' if punch_status == 1 else 'O'
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._state: dict[int, dict] = {}
+
+    def set(self, device_id: int, status: str):
+        with self._lock:
+            st = self._state.setdefault(device_id, {"status": None, "written": None, "written_at": 0.0})
+            st["status"] = status
+
+    def due(self) -> list[tuple[int, str]]:
+        now = time.monotonic()
+        with self._lock:
+            return [(d, s["status"]) for d, s in self._state.items()
+                    if s["status"] and (s["status"] != s["written"] or now - s["written_at"] >= self.HEARTBEAT)]
+
+    def mark_written(self, items):
+        now = time.monotonic()
+        with self._lock:
+            for d, status in items:
+                st = self._state.get(d)
+                if st:
+                    st["written"] = status
+                    st["written_at"] = now
+
+
+# ── Oracle access ──────────────────────────────────────────────────────────────
+INSERT_SQL = """
+    INSERT INTO checkinout (USERID, CHECKTIME, CHECKTYPE, VERIFYCODE, DEVICEID)
+    VALUES (:1, :2, :3, :4, :5)
+"""
+
+
+class OracleSink:
+    def __init__(self):
+        self.log = logging.getLogger("oracle")
+        self._pool = None
+        self._lock = threading.Lock()
+
+    def _get_pool(self):
+        with self._lock:
+            if self._pool is None:
+                self._pool = oracledb.create_pool(
+                    user=DB_CONFIG["user"],
+                    password=DB_CONFIG["password"],
+                    dsn=DB_CONFIG["dsn"],
+                    min=1, max=4, increment=1,
+                    getmode=oracledb.POOL_GETMODE_TIMEDWAIT,
+                    wait_timeout=30000,
+                    ping_interval=30,
+                    tcp_connect_timeout=10,
+                )
+                self.log.info("Oracle connection pool created.")
+            return self._pool
+
+    def _acquire(self):
         try:
-            cur.execute(
-                """
-                INSERT INTO checkinout
-                    (USERID, checktime, Checktype, verifycode, DeviceID)
-                VALUES (:p_uid, :p_ts, :p_ct, :p_vc, :p_did)
-                """,
-                p_uid=str(user_id),
-                p_ts=punch_time,
-                p_ct=checktype,
-                p_vc=verify_code,
-                p_did=device_id,
-            )
+            conn = self._get_pool().acquire()
+        except Exception:
+            self._reset_pool()
+            raise
+        conn.call_timeout = int(_cfg("oracle_call_timeout_seconds", 60)) * 1000
+        return conn
+
+    def _release(self, conn, healthy: bool):
+        pool = self._pool
+        try:
+            if pool is not None and not healthy:
+                pool.drop(conn)
+            else:
+                conn.close()
+        except Exception:
+            pass
+
+    def _reset_pool(self):
+        with self._lock:
+            if self._pool is not None:
+                try:
+                    self._pool.close(force=True)
+                except Exception:
+                    pass
+            self._pool = None
+
+    def _run(self, fn):
+        conn = self._acquire()
+        healthy = False
+        try:
+            result = fn(conn)
+            healthy = True
+            return result
+        finally:
+            self._release(conn, healthy)
+
+    def close(self):
+        self._reset_pool()
+
+    # -- devices --------------------------------------------------------------
+    def fetch_devices(self) -> list[dict]:
+        def q(conn):
+            cur = conn.cursor()
+            cur.execute("SELECT ID, IP, PORT FROM device_machines ORDER BY ID")
+            return [{"device_id": int(r[0]), "ip": str(r[1]).strip(),
+                     "port": int(r[2]) if r[2] is not None else 4370}
+                    for r in cur.fetchall()]
+        return self._run(q)
+
+    def write_statuses(self, items):
+        if not items:
+            return
+
+        def q(conn):
+            cur = conn.cursor()
+            cur.executemany(
+                "UPDATE device_machines SET STATUS = :1, STATUS_TIME = SYSTIMESTAMP WHERE ID = :2",
+                [(status, dev) for dev, status in items])
             conn.commit()
-            return 1
-        except oracledb.IntegrityError as exc:
-            conn.rollback()
-            # Oracle error 1 = ORA-00001 unique constraint violation → genuine duplicate.
-            # Any other integrity error (NOT NULL, FK, check constraint, etc.) is a
-            # real insert failure and must NOT be silently counted as a duplicate.
-            error_obj, = exc.args
-            if getattr(error_obj, "code", None) == 1:
-                return 0
-            logging.getLogger("db").error(
-                f"Insert failed for user={user_id} time={punch_time} "
-                f"device={device_id} (not a duplicate): {error_obj.message}"
-            )
-            return 0
-    finally:
-        conn.close()
+        self._run(q)
+
+    # -- punches ----------------------------------------------------------------
+    @staticmethod
+    def _keys_in_window(cur, device_id: int, start: datetime, end: datetime) -> set:
+        cur.execute(
+            "SELECT USERID, CHECKTIME FROM checkinout "
+            "WHERE DEVICEID = :1 AND CHECKTIME >= :2 AND CHECKTIME < :3",
+            [device_id, start, end])
+        out = set()
+        for uid, ct in cur.fetchall():
+            if ct is None or getattr(ct, "microsecond", 0):
+                continue
+            out.add((str(uid), ct.strftime(TS_FMT)))
+        return out
+
+    def push(self, rows: list[tuple]):
+        """
+        rows: (device_id, user_id, checktime_str, status, punch, attempts)
+        Inserts the rows, commits, then reads them back.
+        Returns (confirmed_keys, failures{key: (attempts, error)}, inserted, dup)
+        """
+        def q(conn):
+            cur = conn.cursor()
+            params = [(uid, str_to_ts(ct), checktype_for(st, pu), st, dev)
+                      for dev, uid, ct, st, pu, _a in rows]
+            cur.executemany(INSERT_SQL, params, batcherrors=True)
+            errors = {e.offset: e for e in cur.getbatcherrors()}
+            conn.commit()
+
+            # ---- read-back verification -----------------------------------
+            windows: dict[tuple[int, str], None] = {}
+            for dev, _uid, ct, *_ in rows:
+                windows[(dev, ct[:10])] = None
+            present: set = set()
+            for dev, day in windows:
+                start = datetime.strptime(day, "%Y-%m-%d")
+                for uid, ct in self._keys_in_window(cur, dev, start, start + timedelta(days=1)):
+                    present.add((dev, uid, ct))
+
+            confirmed, failures = [], {}
+            inserted = dup = 0
+            for i, (dev, uid, ct, _st, _pu, attempts) in enumerate(rows):
+                key = (dev, uid, ct)
+                err = errors.get(i)
+                if key in present:
+                    confirmed.append(key)
+                    if err is None:
+                        inserted += 1
+                    else:
+                        dup += 1
+                    continue
+                if err is None:
+                    msg = "row not found in Oracle after commit"
+                else:
+                    msg = str(err.message).strip()
+                    if not msg.startswith("ORA-"):
+                        msg = f"ORA-{err.code:05d}: {msg}"
+                    if err.code == 1:
+                        msg += (" | unique violation but this punch is NOT in checkinout: the ID "
+                                "primary key/identity probably collided with existing IDs")
+                failures[key] = (attempts, msg)
+            return confirmed, failures, inserted, dup
+
+        return self._run(q)
+
+    def keys_since(self, device_id: int, since: datetime) -> set:
+        def q(conn):
+            cur = conn.cursor()
+            cur.arraysize = 5000
+            return self._keys_in_window(cur, device_id, since, datetime(9999, 1, 1))
+        return self._run(q)
 
 
-# ── Per-device worker ──────────────────────────────────────────────────────────
+# ── Per-device collector ───────────────────────────────────────────────────────
 class DeviceWorker(threading.Thread):
-    def __init__(self, device: dict, stop_event: threading.Event):
+    def __init__(self, device: dict, journal: Journal, board: StatusBoard):
         super().__init__(name=f"Device-{device['device_id']}", daemon=True)
-        self.device = device          # contains device_id, ip, port
-        self.stop_event = stop_event
-        self.log = logging.getLogger(f"Device-{device['device_id']}")
-        self.device_id = device["device_id"]   # from device_machines.ID
-        self._retry_count = 0
+        self.device = device
+        self.device_id = device["device_id"]
+        self.journal = journal
+        self.board = board
+        self.stop_event = threading.Event()
+        self.log = logging.getLogger(self.name)
+
+        self.last_count = None          # record count at last full read
+        self.last_full_read = 0.0       # monotonic
+        self.last_success = None        # datetime of last successful poll
+        self.device_records = None
+        self.capacity = 0
+        self.consecutive_failures = 0
+        self.last_error = None
+        self._last_capacity_warn = 0.0
+
+    def stop(self):
+        self.stop_event.set()
 
     def _make_zk(self) -> ZK:
         return ZK(
             self.device["ip"],
             port=self.device["port"],
-            timeout=10,               # can be made configurable
-            password=0,
-            force_udp=False,
-            ommit_ping=False,
+            timeout=int(_cfg("device_timeout_seconds", 15)),
+            password=int(_cfg("device_password", 0)),
+            force_udp=bool(_cfg("force_udp", False)),
+            # pyzk's ping uses the Windows `ping` command, which is slow and
+            # unreliable; the TCP connect itself tells us if the device is up.
+            ommit_ping=True,
         )
 
-    def _backfill(self, zk_conn):
-        """Back-fill stored attendance records from device memory."""
-        self.log.info("Back-filling historical logs…")
+    @staticmethod
+    def _close(zk_conn):
         try:
-            records = zk_conn.get_attendance()
-            inserted = skipped = 0
-            for rec in records:
-                if self.stop_event.is_set():
-                    break
-                # rec has user_id, timestamp, status (1=IN, 0=OUT), verify?
-                # We'll use status for Checktype, and set verifycode to 0.
-                rows = insert_punch(
-                    user_id=rec.user_id,
-                    punch_time=rec.timestamp,
-                    punch_status=rec.status,   # 1 or 0 (adjust if needed)
-                    verify_code=rec.status,             # default (fingerprint)
-                    device_id=self.device_id,
-                )
-                if rows:
-                    inserted += 1
-                else:
-                    skipped += 1
-            self.log.info(f"Back-fill done: {inserted} new, {skipped} duplicate(s).")
-        except Exception as exc:
-            self.log.warning(f"Back-fill failed (non-fatal): {exc}")
-
-    def _live_capture(self, zk_conn):
-        """Stream real-time punches from the device."""
-        self.log.info("Live capture started.")
-        for attendance in zk_conn.live_capture():
-            if self.stop_event.is_set():
-                break
-            if attendance is None:
-                continue
-            try:
-                rows = insert_punch(
-                    user_id=attendance.user_id,
-                    punch_time=attendance.timestamp,
-                    punch_status=attendance.status,
-                    verify_code=attendance.status,
-                    device_id=self.device_id,
-                )
-                tag = "IN" if rows else "DUP"
-                self.log.info(f"[{tag}] user={attendance.user_id} time={attendance.timestamp}")
-            except Exception as exc:
-                # Never let a single bad insert kill the live-capture stream —
-                # that would force a full reconnect and can permanently lose
-                # this record if the device doesn't re-offer it on backfill.
-                self.log.error(
-                    f"Failed to insert live punch user={attendance.user_id} "
-                    f"time={attendance.timestamp}: {exc}"
-                )
-
-    def run(self):
-        retry_delay = SYNC_CONFIG["retry_delay_seconds"]
-        max_retries = SYNC_CONFIG.get("max_retries", 0)
-
-        while not self.stop_event.is_set():
-            zk_conn = None
-            try:
-                self.log.info(f"Connecting to {self.device['ip']}:{self.device['port']} (attempt {self._retry_count + 1})…")
-                zk_conn = self._make_zk().connect()
-
-                self._retry_count = 0
-                with _connected_devices_lock:
-                    _connected_devices.add(self.device_id)
-                set_device_status(self.device_id, "ONLINE")
-                self.log.info("Device ONLINE.")
-
-                zk_conn.disable_device()
-                if SYNC_CONFIG.get("backfill_on_start", True):
-                    self._backfill(zk_conn)
-
-                zk_conn.enable_device()
-                self._live_capture(zk_conn)
-
-            except Exception as exc:
-                self._retry_count += 1
-                self.log.error(f"Error (attempt {self._retry_count}): {exc}")
-
-                try:
-                    set_device_status(self.device_id, "OFFLINE")
-                except Exception:
-                    pass
-
-                if max_retries and self._retry_count >= max_retries:
-                    self.log.error(f"Reached max_retries={max_retries}. Worker stopping.")
-                    break
-
-            finally:
-                with _connected_devices_lock:
-                    _connected_devices.discard(self.device_id)
-                if zk_conn:
-                    try:
-                        zk_conn.enable_device()
-                        zk_conn.disconnect()
-                    except Exception:
-                        pass
-
-            if not self.stop_event.is_set():
-                self.log.info(f"Reconnecting in {retry_delay}s…")
-                self.stop_event.wait(timeout=retry_delay)
-
-        self.log.info("Worker stopped.")
+            zk_conn.disconnect()
+        except Exception:
+            pass
         try:
-            set_device_status(self.device_id, "OFFLINE")
+            zk_conn._ZK__sock.close()   # make sure the socket is released
         except Exception:
             pass
 
+    def _read_with_retries(self, zk_conn):
+        last_exc = None
+        for attempt in range(1, 4):
+            try:
+                return read_attendance(zk_conn)
+            except AttendanceReadError as exc:
+                last_exc = exc
+                self.log.warning("Inconsistent log read (attempt %d/3): %s", attempt, exc)
+                time.sleep(1)
+        raise last_exc
 
-# ── Device Monitor (Ping every 10 seconds) ────────────────────────────────────
-class DeviceMonitor(threading.Thread):
-    """
-    Periodically pings all devices to update their status in device_machines.
-    Runs every 10 seconds (adjustable).
-    """
-
-    def __init__(self, stop_event: threading.Event):
-        super().__init__(name="DeviceMonitor", daemon=True)
-        self.stop_event = stop_event
-        self.log = logging.getLogger("monitor")
-        self.interval = 10  # seconds
-
-    def ping_device(self, device_ip: str, port: int) -> bool:
-        """Attempt a connection and disconnect immediately. Return True on success."""
+    def _poll_once(self):
+        zk_conn = self._make_zk().connect()
         try:
-            zk = ZK(device_ip, port=port, timeout=3)  # short timeout for ping
-            conn = zk.connect()
-            conn.disconnect()
-            return True
-        except Exception:
-            return False
+            zk_conn.read_sizes()
+            count = zk_conn.records
+            self.device_records = count
+            self.capacity = zk_conn.rec_cap
+
+            full_due = time.monotonic() - self.last_full_read >= int(_cfg("full_read_interval_seconds", 600))
+            if self.last_count is not None and count == self.last_count and not full_due:
+                return  # nothing new on the device
+
+            disabled = False
+            if _cfg("disable_device_during_read", False):
+                zk_conn.disable_device()
+                disabled = True
+            try:
+                result = self._read_with_retries(zk_conn)
+            finally:
+                if disabled:
+                    try:
+                        zk_conn.enable_device()
+                    except Exception as exc:
+                        self.log.error("Could not re-enable device: %s", exc)
+
+            # --- persist (fsync'd) before anything else ---------------------
+            added = self.journal.add_records(self.device_id, result.records)
+            for b in self.journal.add_bad(self.device_id, result.bad):
+                self.log.error("Undecodable record kept in journal.bad_records: %s (%s)", b.raw_hex, b.error)
+
+            # --- double check: every record read is now in the journal ------
+            distinct = len({(r.user_id, r.timestamp) for r in result.records})
+            in_journal = self.journal.count_for_device(self.device_id)
+            if in_journal < distinct:
+                raise RuntimeError(
+                    f"journal has {in_journal} records but device returned {distinct} distinct records")
+
+            self.last_count = result.device_count
+            self.last_full_read = time.monotonic()
+            self.device_records = result.device_count
+            if added:
+                self.log.info("Read %d record(s) from device (layout %d bytes); %d NEW saved to journal.",
+                              len(result.records), result.record_size, added)
+
+            if self.capacity and result.device_count >= 0.9 * self.capacity \
+                    and time.monotonic() - self._last_capacity_warn > 3600:
+                self._last_capacity_warn = time.monotonic()
+                self.log.warning(
+                    "Device attendance log is %d%% full (%d/%d). All records are already saved "
+                    "in the journal; consider clearing the device log to avoid overwrite/stop.",
+                    100 * result.device_count // self.capacity, result.device_count, self.capacity)
+        finally:
+            self._close(zk_conn)
 
     def run(self):
+        poll = int(_cfg("poll_interval_seconds", 60))
+        min_delay = int(_cfg("reconnect_min_delay_seconds", 5))
+        max_delay = int(_cfg("reconnect_max_delay_seconds", 60))
+        delay = min_delay
+        self.log.info("Collector started for %s:%s.", self.device["ip"], self.device["port"])
+
         while not self.stop_event.is_set():
             try:
-                conn = get_db()
-                cur = conn.cursor()
-                cur.execute("SELECT ID, IP, PORT FROM device_machines")
-                rows = cur.fetchall()
-                conn.close()
+                self._poll_once()
+                if self.consecutive_failures:
+                    self.log.info("Device reachable again after %d failed attempt(s).",
+                                  self.consecutive_failures)
+                self.consecutive_failures = 0
+                self.last_error = None
+                self.last_success = datetime.now()
+                self.board.set(self.device_id, "ONLINE")
+                delay = min_delay
+                self.stop_event.wait(poll)
+            except Exception as exc:
+                self.consecutive_failures += 1
+                self.last_error = f"{type(exc).__name__}: {exc}"
+                self.board.set(self.device_id, "OFFLINE")
+                if self.consecutive_failures == 1:
+                    self.log.error("Device poll failed: %s", self.last_error, exc_info=True)
+                else:
+                    self.log.warning("Device still unreachable (attempt %d): %s",
+                                     self.consecutive_failures, self.last_error)
+                self.log.info("Reconnecting in %ss...", delay)
+                self.stop_event.wait(delay)
+                delay = min(delay * 2, max_delay)
 
-                for device_id, ip, port in rows:
-                    if self.stop_event.is_set():
-                        break
-
-                    with _connected_devices_lock:
-                        worker_owns_it = device_id in _connected_devices
-                    if worker_owns_it:
-                        # A DeviceWorker already holds a live connection and
-                        # keeps this device's status current itself — pinging
-                        # here would open a second connection and risk
-                        # knocking that live_capture() session offline.
-                        continue
-
-                    online = self.ping_device(ip, port or 4370)
-                    status = "ONLINE" if online else "OFFLINE"
-                    set_device_status(device_id, status)
-                    if not online:
-                        self.log.warning(f"Device {ip} is OFFLINE (ping failed)")
-
-            except Exception as e:
-                self.log.error(f"Monitor error: {e}")
-
-            self.stop_event.wait(timeout=self.interval)
-
-        self.log.info("Monitor stopped.")
+        self.log.info("Collector stopped.")
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+# ── Journal -> Oracle ──────────────────────────────────────────────────────────
+class OracleSyncWorker(threading.Thread):
+    def __init__(self, journal: Journal, sink: OracleSink, board: StatusBoard, stop: threading.Event):
+        super().__init__(name="OracleSync", daemon=False)
+        self.journal = journal
+        self.sink = sink
+        self.board = board
+        self.stop = stop
+        self.log = logging.getLogger(self.name)
+        self._down_since = None
+        self._last_down_log = 0.0
+
+    def _cycle(self):
+        items = self.board.due()
+        if items:
+            try:
+                self.sink.write_statuses(items)
+                self.board.mark_written(items)
+            except Exception as exc:
+                self.log.warning("Could not update device status: %s", exc)
+                raise
+
+        batch = int(_cfg("oracle_batch_size", 500))
+        while True:
+            rows = self.journal.fetch_pending(batch)
+            if not rows:
+                return
+            confirmed, failures, inserted, dup = self.sink.push(rows)
+            self.journal.mark_synced(confirmed)
+            self.journal.mark_failed(failures)
+            self.log.info("Oracle sync: %d sent, %d inserted, %d already present, %d verified, %d failed.",
+                          len(rows), inserted, dup, len(confirmed), len(failures))
+            for (dev, uid, ct), (attempts, err) in failures.items():
+                self.log.error("NOT synced (kept in journal, will retry) device=%s user=%s time=%s "
+                               "attempt=%d: %s", dev, uid, ct, attempts + 1, err)
+            if len(rows) < batch or self.stop.is_set():
+                return
+
+    def run(self):
+        interval = int(_cfg("oracle_sync_interval_seconds", 5))
+        backoff = 2
+        self.log.info("Oracle sync worker started.")
+        while True:
+            final = self.stop.is_set()
+            try:
+                self._cycle()
+                if self._down_since:
+                    self.log.info("Oracle reachable again (was down since %s).",
+                                  self._down_since.strftime(TS_FMT))
+                self._down_since = None
+                backoff = 2
+                wait = interval
+            except Exception as exc:
+                now = time.monotonic()
+                if self._down_since is None:
+                    self._down_since = datetime.now()
+                    self._last_down_log = now
+                    self.log.error("Oracle sync failed (records stay safe in journal): %s", exc)
+                elif now - self._last_down_log >= 600:
+                    self._last_down_log = now
+                    self.log.error("Oracle still unavailable since %s: %s",
+                                   self._down_since.strftime(TS_FMT), exc)
+                wait = backoff
+                backoff = min(backoff * 2, 60)
+            if final:
+                break
+            self.stop.wait(wait)
+        self.log.info("Oracle sync worker stopped.")
+
+
+# ── Audit: journal vs Oracle ───────────────────────────────────────────────────
+class AuditWorker(threading.Thread):
+    def __init__(self, journal: Journal, sink: OracleSink, stop: threading.Event):
+        super().__init__(name="Audit", daemon=True)
+        self.journal = journal
+        self.sink = sink
+        self.stop = stop
+        self.log = logging.getLogger(self.name)
+
+    def audit_once(self) -> int:
+        days = int(_cfg("audit_lookback_days", 31))
+        since = (datetime.now() - timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
+        since_str = ts_to_str(since)
+        total_missing = 0
+        for dev in self.journal.device_ids():
+            if self.stop.is_set():
+                break
+            # Journal first, then Oracle: every key read here was verified in
+            # Oracle before being marked synced, so a miss means it vanished.
+            j = self.journal.synced_keys_since(dev, since_str)
+            if not j:
+                continue
+            o = self.sink.keys_since(dev, since)
+            missing = j - o
+            if missing:
+                total_missing += len(missing)
+                self.journal.mark_unsynced([(dev, uid, ct) for uid, ct in missing])
+                self.log.warning("Device %s: %d synced record(s) missing in Oracle -> re-queued. e.g. %s",
+                                 dev, len(missing), sorted(missing)[:5])
+            else:
+                self.log.info("Device %s: all %d journal record(s) since %s present in Oracle.",
+                              dev, len(j), since.date())
+        return total_missing
+
+    def run(self):
+        interval = int(_cfg("audit_interval_seconds", 3600))
+        if self.stop.wait(300):  # first audit 5 minutes after start
+            return
+        while not self.stop.is_set():
+            try:
+                self.audit_once()
+            except Exception as exc:
+                self.log.error("Audit failed (will retry): %s", exc)
+            self.stop.wait(interval)
+
+
+# ── Supervisor ─────────────────────────────────────────────────────────────────
+class Supervisor:
+    def __init__(self):
+        self.log = logging.getLogger("main")
+        self.stop = threading.Event()
+        self.journal = Journal(_app_path(_cfg("journal_path", "zkteco_journal.db")))
+        self.sink = OracleSink()
+        self.board = StatusBoard()
+        self.workers: dict[int, DeviceWorker] = {}
+
+    def _load_devices(self):
+        try:
+            devices = self.sink.fetch_devices()
+            self.journal.cache_devices(devices)
+            return devices
+        except Exception as exc:
+            cached = self.journal.cached_devices()
+            if cached:
+                self.log.warning("Cannot read device_machines from Oracle (%s); using %d cached device(s).",
+                                 exc, len(cached))
+                return cached
+            self.log.error("Cannot read device_machines from Oracle and no cached list yet: %s", exc)
+            return None
+
+    def _apply_devices(self, devices):
+        wanted = {d["device_id"]: d for d in devices}
+        for dev_id, w in list(self.workers.items()):
+            d = wanted.get(dev_id)
+            if d is None or (d["ip"], d["port"]) != (w.device["ip"], w.device["port"]) or not w.is_alive():
+                reason = "removed" if d is None else "changed/restarted"
+                self.log.info("Stopping collector for device %s (%s).", dev_id, reason)
+                w.stop()
+                w.join(timeout=60)
+                del self.workers[dev_id]
+        for dev_id, d in wanted.items():
+            if dev_id not in self.workers:
+                w = DeviceWorker(d, self.journal, self.board)
+                self.workers[dev_id] = w
+                w.start()
+
+    def _summary(self):
+        stats = self.journal.stats()
+        for dev_id, w in sorted(self.workers.items()):
+            s = stats.get(dev_id, {"total": 0, "pending": 0, "failing": 0})
+            age = (datetime.now() - w.last_success).total_seconds() if w.last_success else None
+            self.log.info(
+                "[summary] device %s %s:%s | %s | last OK read: %s | on device: %s | journal: %d "
+                "| pending Oracle: %d | failing: %d",
+                dev_id, w.device["ip"], w.device["port"],
+                "ONLINE" if w.consecutive_failures == 0 and w.last_success else "OFFLINE",
+                w.last_success.strftime(TS_FMT) if w.last_success else "never",
+                w.device_records if w.device_records is not None else "?",
+                s["total"], s["pending"], s["failing"])
+            if age is None or age > 600:
+                self.log.warning("[summary] device %s has not been read for %s. Last error: %s",
+                                 dev_id, "ever" if age is None else f"{int(age // 60)} min", w.last_error)
+        for dev, uid, ct, attempts, err in self.journal.failing_samples():
+            self.log.warning("[summary] failing record device=%s user=%s time=%s attempts=%d: %s",
+                             dev, uid, ct, attempts, err)
+        bad = self.journal.bad_count()
+        if bad:
+            self.log.warning("[summary] %d undecodable record(s) stored in journal table bad_records.", bad)
+
+    def run(self):
+        self.log.info("Starting ZKTeco sync service. Journal: %s", self.journal.path)
+
+        def _shutdown(sig, frame):
+            self.log.info("Shutdown signal received - stopping...")
+            self.stop.set()
+
+        signal.signal(signal.SIGINT, _shutdown)
+        signal.signal(signal.SIGTERM, _shutdown)
+        if hasattr(signal, "SIGBREAK"):
+            signal.signal(signal.SIGBREAK, _shutdown)
+
+        sync = OracleSyncWorker(self.journal, self.sink, self.board, self.stop)
+        audit = AuditWorker(self.journal, self.sink, self.stop)
+        sync.start()
+        audit.start()
+
+        refresh = int(_cfg("device_refresh_interval_seconds", 300))
+        summary_every = int(_cfg("status_summary_interval_seconds", 600))
+        next_refresh = 0.0
+        next_summary = time.monotonic() + 120
+        while not self.stop.is_set():
+            now = time.monotonic()
+            if now >= next_refresh:
+                devices = self._load_devices()
+                if devices is not None:
+                    if not devices:
+                        self.log.error("No devices in device_machines.")
+                    self._apply_devices(devices)
+                    next_refresh = now + refresh
+                else:
+                    next_refresh = now + 30
+            if now >= next_summary:
+                try:
+                    self._summary()
+                except Exception as exc:
+                    self.log.error("Summary failed: %s", exc)
+                next_summary = now + summary_every
+            self.stop.wait(1)
+
+        for w in self.workers.values():
+            w.stop()
+        for w in self.workers.values():
+            w.join(timeout=60)
+        sync.join(timeout=120)   # final flush of pending records to Oracle
+        self.sink.close()
+        self.log.info("Stopped. Unsynced records (if any) remain in the journal and "
+                      "will be sent on next start.")
+
+
 def main():
-    log = logging.getLogger("main")
-
-    # Test direct connection and read devices
-    try:
-        direct_conn = oracledb.connect(
-            user=DB_CONFIG["user"],
-            password=DB_CONFIG["password"],
-            dsn=DB_CONFIG["dsn"]
-        )
-    except oracledb.DatabaseError as e:
-        log.error(f"Failed to connect to Oracle: {e}")
-        log.error("Please check your DB_CONFIG settings.")
-        sys.exit(1)
-
-    devices = get_devices_from_db(direct_conn)
-    direct_conn.close()
-
-    if not devices:
-        log.error("No devices found in 'device_machines' – exiting.")
-        sys.exit(1)
-
-    log.info(f"Found {len(devices)} device(s) in database.")
-
-    # Create pool and start workers
-    pool_size = min(len(devices) + 2, 32)
-    _init_pool(pool_size)
-
-    stop_event = threading.Event()
-    workers = [DeviceWorker(device, stop_event) for device in devices]
-
-    # Start monitor
-    monitor = DeviceMonitor(stop_event)
-    monitor.start()
-
-    def _shutdown(sig, frame):
-        log.info("Shutdown signal received — stopping workers and monitor…")
-        stop_event.set()
-
-    signal.signal(signal.SIGINT, _shutdown)
-    signal.signal(signal.SIGTERM, _shutdown)
-
-    log.info(f"Starting {len(workers)} device worker(s)…")
-    for w in workers:
-        w.start()
-
-    for w in workers:
-        w.join()
-
-    monitor.join(timeout=5)
-    log.info("All workers stopped. Exiting.")
+    setup_logging()
+    Supervisor().run()
 
 
 if __name__ == "__main__":
