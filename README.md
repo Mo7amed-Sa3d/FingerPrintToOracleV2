@@ -114,6 +114,8 @@ COMMIT;
    running in the window, you are asked to restart it so it uses the new settings.
 
 ### Or by editing `settings.env`
+Copy `settings.env.example` to `settings.env` next to the app and fill it in. `settings.env` is
+not committed to git, because it holds the password.
 ```ini
 DB_USER=attendance_user
 DB_PASSWORD=your_password
