@@ -438,6 +438,33 @@ class DeviceWorker(threading.Thread):
                 time.sleep(1)
         raise last_exc
 
+    def _check_log_reduction(self, zk_conn, count: int) -> int:
+        """
+        The device's record count can only go DOWN if records were deleted
+        (by ZKTeco software "delete after download", a scheduled clear, or on
+        the device menu). Records deleted before this app read them cannot be
+        recovered, so make it loud. Works across restarts (count is persisted).
+        """
+        state = self.journal.device_state(self.device_id)
+        if not state or state["last_count"] is None or count >= state["last_count"]:
+            return count
+        # Re-check once so a glitchy reading never raises a false alarm.
+        zk_conn.read_sizes()
+        count = zk_conn.records
+        if count >= state["last_count"]:
+            return count
+        last_read = state["last_read_at"] or "unknown"
+        self.journal.record_log_reduction(self.device_id, state["last_count"], count, state["last_read_at"])
+        self.log.critical(
+            "ATTENDANCE LOG ON THIS DEVICE WAS DELETED: it had %d record(s) at the last read (%s), now %d. "
+            "Something else cleared it (ZKTeco software 'delete after download', a scheduled clear, or the "
+            "device menu). Every record read before %s is safe in the journal, but punches made AFTER %s "
+            "and before the clear were never read and CANNOT be recovered. Turn off any 'delete/clear "
+            "after download' option in other software. (If you cleared it yourself after checking "
+            "'Waiting for Oracle' was 0 in the Devices tab, nothing was lost.)",
+            state["last_count"], last_read, count, last_read, last_read)
+        return count
+
     def _poll_once(self):
         zk_conn = self._make_zk().connect()
         try:
@@ -445,6 +472,7 @@ class DeviceWorker(threading.Thread):
             count = zk_conn.records
             self.device_records = count
             self.capacity = zk_conn.rec_cap
+            count = self._check_log_reduction(zk_conn, count)
 
             full_due = time.monotonic() - self.last_full_read >= int(_cfg("full_read_interval_seconds", 600))
             if self.last_count is not None and count == self.last_count and not full_due:
@@ -477,6 +505,7 @@ class DeviceWorker(threading.Thread):
 
             self.last_count = result.device_count
             self.last_full_read = time.monotonic()
+            self.journal.set_device_count(self.device_id, result.device_count)
             self.device_records = result.device_count
             if added:
                 self.log.info("Read %d record(s) from device (layout %d bytes); %d NEW saved to journal.",
@@ -712,6 +741,13 @@ class Supervisor:
         bad = self.journal.bad_count()
         if bad:
             self.log.warning("[summary] %d undecodable record(s) stored in journal table bad_records.", bad)
+        day_ago = (datetime.now() - timedelta(days=1)).strftime(TS_FMT)
+        for dev, st in sorted(self.journal.all_device_states().items()):
+            if st["cleared_at"] and st["cleared_at"] >= day_ago:
+                self.log.error("[summary] device %s: attendance log was deleted at %s (%s -> %s records); "
+                               "punches after %s and before that may be lost.",
+                               dev, st["cleared_at"], st["cleared_from"], st["cleared_to"],
+                               st["cleared_after"] or "the last read")
 
     def run(self, install_signals: bool = True):
         self.log.info("Starting ZKTeco sync service. Journal: %s", self.journal.path)

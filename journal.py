@@ -50,6 +50,17 @@ CREATE TABLE IF NOT EXISTS bad_records (
     PRIMARY KEY (device_id, raw_hex)
 );
 
+-- Last known record count per device, to detect logs deleted by other software.
+CREATE TABLE IF NOT EXISTS device_state (
+    device_id      INTEGER PRIMARY KEY,
+    last_count     INTEGER,
+    last_read_at   TEXT,      -- last successful full read
+    cleared_at     TEXT,      -- last time the device log shrank
+    cleared_from   INTEGER,
+    cleared_to     INTEGER,
+    cleared_after  TEXT       -- last successful read before it shrank
+);
+
 CREATE TABLE IF NOT EXISTS devices_cache (
     device_id INTEGER PRIMARY KEY,
     ip        TEXT    NOT NULL,
@@ -195,6 +206,41 @@ class Journal:
 
     def bad_count(self) -> int:
         return self._conn().execute("SELECT COUNT(*) FROM bad_records").fetchone()[0]
+
+    # ── Device record-count tracking (detects logs deleted by other software) ──
+    def device_state(self, device_id: int) -> dict | None:
+        row = self._conn().execute(
+            "SELECT last_count, last_read_at, cleared_at, cleared_from, cleared_to, cleared_after "
+            "FROM device_state WHERE device_id = ?", (device_id,)).fetchone()
+        if row is None:
+            return None
+        keys = ("last_count", "last_read_at", "cleared_at", "cleared_from", "cleared_to", "cleared_after")
+        return dict(zip(keys, row))
+
+    def all_device_states(self) -> dict:
+        out = {}
+        for row in self._conn().execute(
+                "SELECT device_id, last_count, last_read_at, cleared_at, cleared_from, cleared_to, "
+                "cleared_after FROM device_state"):
+            out[row[0]] = dict(zip(("last_count", "last_read_at", "cleared_at", "cleared_from",
+                                    "cleared_to", "cleared_after"), row[1:]))
+        return out
+
+    def set_device_count(self, device_id: int, count: int) -> None:
+        """Called after every successful full read of the device log."""
+        with self._tx() as c:
+            c.execute(
+                "INSERT INTO device_state (device_id, last_count, last_read_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(device_id) DO UPDATE SET last_count = excluded.last_count, "
+                "last_read_at = excluded.last_read_at",
+                (device_id, count, now_str()))
+
+    def record_log_reduction(self, device_id: int, old: int, new: int, last_read_at) -> None:
+        with self._tx() as c:
+            c.execute(
+                "UPDATE device_state SET last_count = ?, cleared_at = ?, cleared_from = ?, "
+                "cleared_to = ?, cleared_after = ? WHERE device_id = ?",
+                (new, now_str(), old, new, last_read_at, device_id))
 
     # ── Device list cache (so collection works while Oracle is down) ──────────
     def cache_devices(self, devices: list[dict]) -> None:

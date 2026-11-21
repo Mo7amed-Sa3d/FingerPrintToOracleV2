@@ -444,9 +444,10 @@ class App:
         ttk.Button(top, text="Refresh", command=self.refresh_devices).pack(side="left")
         self.dev_msg = ttk.Label(top, text="", style="Hint.TLabel")
         self.dev_msg.pack(side="left", padx=10)
-        cols = ("ID", "IP address", "Port", "Status", "Status time", "Records collected",
-                "Waiting for Oracle", "Failing", "Latest punch")
-        frame, self.dev_tree = self._tree(tab, cols, (50, 130, 60, 90, 150, 120, 120, 70, 150))
+        cols = ("ID", "IP address", "Port", "Status", "Status time", "Collected",
+                "Waiting", "Failing", "Latest punch", "Log deleted")
+        frame, self.dev_tree = self._tree(tab, cols, (40, 115, 55, 75, 140, 85, 70, 60, 140, 210))
+        self.dev_tree.bind("<Double-1>", self._device_details)
         frame.pack(fill="both", expand=True)
         ttk.Label(tab, text="Devices are managed in the Oracle table device_machines; changes are picked "
                             "up by the service within 5 minutes.", style="Hint.TLabel").pack(anchor="w", pady=(6, 0))
@@ -458,6 +459,7 @@ class App:
             stats = self.journal.stats()
             latest = dict(self.journal._conn().execute(
                 "SELECT device_id, MAX(checktime) FROM punches GROUP BY device_id").fetchall())
+            states = self.journal.all_device_states()
             err = None
             try:
                 conn = oracledb.connect(**config.DB_CONFIG, tcp_connect_timeout=8)
@@ -471,20 +473,29 @@ class App:
                 err = str(exc).splitlines()[0]
                 devices = [(d["device_id"], d["ip"], d["port"], "?", None)
                            for d in self.journal.cached_devices()]
-            return devices, stats, latest, err
+            return devices, stats, latest, states, err
 
         def show(res):
-            devices, stats, latest, err = res
+            devices, stats, latest, states, err = res
+            recent = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+            self._dev_states = states
             self.dev_tree.delete(*self.dev_tree.get_children())
             for dev_id, ip, port, status, st_time in devices:
                 s = stats.get(dev_id, {"total": 0, "pending": 0, "failing": 0})
                 tag = "ok" if status == "ONLINE" else "bad" if status == "OFFLINE" else ""
+                st = states.get(dev_id) or {}
+                cleared = ""
+                if st.get("cleared_at"):
+                    cleared = f"{st['cleared_at'][:16]}  ({st['cleared_from']:,} -> {st['cleared_to']:,})"
+                    if st["cleared_at"] >= recent:
+                        tag = "bad"
                 if s["failing"]:
                     tag = "bad"
-                self.dev_tree.insert("", "end", tags=(tag,), values=(
+                self.dev_tree.insert("", "end", iid=str(dev_id), tags=(tag,), values=(
                     dev_id, ip, port, status,
                     st_time.strftime("%Y-%m-%d %H:%M:%S") if st_time else "",
-                    f"{s['total']:,}", f"{s['pending']:,}", f"{s['failing']:,}", latest.get(dev_id, "")))
+                    f"{s['total']:,}", f"{s['pending']:,}", f"{s['failing']:,}", latest.get(dev_id, ""),
+                    cleared))
             if err:
                 self.dev_msg.config(text=f"Oracle not reachable ({err}). Showing the cached device list.")
             else:
@@ -492,6 +503,26 @@ class App:
             self._fill_device_filter([d[0] for d in devices] + list(stats))
 
         self.bg(work, show, lambda e: self.dev_msg.config(text=f"Error: {e}"))
+
+    def _device_details(self, _event):
+        sel = self.dev_tree.selection()
+        if not sel:
+            return
+        st = getattr(self, "_dev_states", {}).get(int(sel[0])) or {}
+        if not st.get("cleared_at"):
+            messagebox.showinfo(APP_TITLE, f"Device {sel[0]}: no deletion of the attendance log detected.")
+            return
+        messagebox.showwarning(
+            APP_TITLE,
+            f"Device {sel[0]}: the attendance log was deleted.\n\n"
+            f"Detected:  {st['cleared_at']}\n"
+            f"Records:   {st['cleared_from']:,} before, {st['cleared_to']:,} after\n"
+            f"Last read before the deletion:  {st['cleared_after'] or 'unknown'}\n\n"
+            "Everything read up to that last read is safe. Punches made after it and before the "
+            "deletion were never read and cannot be recovered.\n\n"
+            "If you cleared the device yourself after checking 'Waiting for Oracle' was 0, "
+            "nothing was lost. Otherwise turn off any 'delete/clear after download' option in "
+            "the ZKTeco software.")
 
     # ── Records tab ───────────────────────────────────────────────────────────
     def _build_records_tab(self, nb):

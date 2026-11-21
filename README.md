@@ -147,7 +147,7 @@ Double-click **`ZKTecoSync.exe`** and click **Start** (top left).
 | **Start / Stop** | Starts or stops collecting inside this window |
 | **Totals** (top right) | Records collected, records still waiting for Oracle, and failing records (red) |
 | **Database** tab | Oracle connection settings: test and save ([section 5](#5-configure-the-connection)) |
-| **Devices** tab | Every device in `device_machines`: IP, port, ONLINE/OFFLINE, status time, records collected, waiting, failing, latest punch. Click **Refresh** to update. |
+| **Devices** tab | Every device in `device_machines`: IP, port, ONLINE/OFFLINE, status time, records collected, waiting for Oracle, failing, latest punch, and **Log deleted** (when the device's attendance log was last deleted; the row turns red for 7 days, double-click for details). Click **Refresh** to update. |
 | **Records** tab | Every record ever collected. Filter by device, user ID, date range (`YYYY-MM-DD`) and state (*In Oracle / Waiting / Failing*), then **Search**. Shows the newest 2,000; **Export CSV…** saves all matching records in a file Excel can open. Double-click a row for details. |
 | **Logs** tab | Live view of `zkteco_sync.log`. Filter *All / Warnings and errors / Errors only / Summary only*. Errors are red and warnings orange. **Open log folder** opens the folder in Explorer. |
 
@@ -215,6 +215,7 @@ Lines to look out for:
 | `NOT synced (kept in journal, will retry)` | Oracle rejected a record. The reason follows, see [Troubleshooting](#11-troubleshooting). |
 | `missing in Oracle -> re-queued` | The hourly audit found records deleted from Oracle and is re-inserting them. |
 | `attendance log is 90% full` | Clear the device log soon (see [section 10](#10-daily-operation)). |
+| `ATTENDANCE LOG ON THIS DEVICE WAS DELETED` (CRITICAL) | The device's record count went **down**, so something deleted its log. Punches made between the time shown and the deletion may be lost. See [Other attendance software](#other-attendance-software). |
 
 ### c) Console status (Python only)
 `python sync_service.py --status` prints the same per-device counts in a console window.
@@ -289,9 +290,12 @@ Notes:
 ### Clearing a device's attendance log safely
 ZKTeco devices have limited memory. Before clearing a device's log (on the device, or with ZKTime):
 1. Wait at least 2 minutes after the last punch.
-2. Open `ZKTecoSync.exe` → **Devices** tab → **Refresh**. That device must show **Waiting for
-   Oracle 0** and **Failing 0**, and **Latest punch** must match the latest punch on the device.
+2. Open `ZKTecoSync.exe` → **Devices** tab → **Refresh**. That device must show **Waiting 0** and
+   **Failing 0**, and **Latest punch** must match the latest punch on the device.
 3. Now clear the log.
+
+Afterwards the app logs `ATTENDANCE LOG ON THIS DEVICE WAS DELETED` and shows the date in the
+**Log deleted** column. That is expected when you cleared it yourself after these checks; nothing was lost.
 
 > The only way a record can be lost is if it is deleted from a device **before the app has read it**,
 > for example clearing a device while the app is stopped. Always follow the steps above.
@@ -314,9 +318,19 @@ from the journal table `punches` (or delete `zkteco_journal.db` entirely; it is 
 is still on the devices). Then start the app again.
 
 ### Other attendance software
-ZKTeco devices often allow only one PC connection at a time. If ZKTime / ZKBioTime also polls the
-devices, some reads will fail while it is connected. They are retried automatically and nothing is
-lost, but readings can be delayed.
+Best: let this app be the **only** program that talks to the devices. If ZKTime / ZKBioTime /
+ZKAccess must also connect:
+
+| Situation | Effect | What to do |
+|---|---|---|
+| The other software **deletes or clears the log after downloading** (or on a schedule) | **Can lose records.** Punches made since this app's last read are deleted before it sees them. | Turn off every "delete/clear attendance after download" option. The app detects every deletion and logs `ATTENDANCE LOG ON THIS DEVICE WAS DELETED` with the time window at risk. |
+| The device allows only one connection and the other software is downloading | Reads fail and are retried (5–60 s). Records are delayed, not lost. | Nothing needed |
+| The other software keeps a **permanent connection** (real-time monitoring window) | This app may never get in. Records wait on the device; the device shows OFFLINE and the log warns `has not been read for X min`. | Close the real-time monitoring window |
+| A Comm Key is set on the device | `Unauthenticated`; records wait on the device | Add `DEVICE_PASSWORD=<key>` to `settings.env` |
+
+Reading the log never removes anything, so both programs reading at the same time is not a problem.
+Whether a device allows one or several connections depends on its firmware. Test with both
+programs running and watch the Devices tab for a day.
 
 ---
 
